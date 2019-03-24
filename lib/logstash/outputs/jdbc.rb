@@ -55,6 +55,9 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
   # jdbc password - optional, maybe in the connection string
   config :password, validate: :string, required: false
 
+  # [ "insert into table (msg) values(?)", "%{msg}" ]
+  config :onfailed_statement, validate: :array, default: []
+
   # [ "insert into table (message) values(?)", "%{message}" ]
   config :statement, validate: :array, required: true
 
@@ -200,6 +203,41 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
     end
   end
 
+  def onfailed_submit(events)
+    connection = nil
+    statement = nil
+    events_to_retry = []
+
+    return unless @onfailed_statement.empty?
+
+    begin
+      connection = @pool.getConnection
+    rescue => e
+      log_jdbc_exception(e, true, nil)
+      # If a connection is not available, then the server has gone away
+      # We're not counting that towards our retry count.
+      return events, false
+    end
+
+    events.each do |event|
+      begin
+        statement = connection.prepareStatement( @onfailed_statement[0] )
+        statement = onfailed_add_statement_event_params(statement, event) if @onfailed_statement.length > 1
+        statement.execute
+      rescue => e
+        if retry_exception?(e, event.to_json())
+          events_to_retry.push(event)
+        end
+      ensure
+        statement.close unless statement.nil?
+      end
+    end
+
+    connection.close unless connection.nil?
+
+    return events_to_retry, true
+  end
+
   def submit(events)
     connection = nil
     statement = nil
@@ -224,6 +262,8 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
       rescue => e
         if retry_exception?(e, event.to_json())
           events_to_retry.push(event)
+        else
+          onfailed_submit([event])
         end
       ensure
         statement.close unless statement.nil?
@@ -256,6 +296,7 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
 
         if attempts > @max_flush_exceptions
           @logger.error("JDBC - max_flush_exceptions has been reached. #{submit_actions.length} events have been unable to be sent to SQL and are being dropped. See previously logged exceptions for details.")
+          onfailed_submit(submit_actions)
           break
         end
       end
@@ -269,6 +310,56 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
 
   def add_statement_event_params(statement, event)
     @statement[1..-1].each_with_index do |i, idx|
+      if @enable_event_as_json_keyword == true and i.is_a? String and i == @event_as_json_keyword
+        value = event.to_json
+      elsif i.is_a? String
+        value = event.get(i)
+        if value.nil? and i =~ /%\{/
+          value = event.sprintf(i)
+        end
+      else
+        value = i
+      end
+
+      case value
+      when Time
+        # See LogStash::Timestamp, below, for the why behind strftime.
+        statement.setString(idx + 1, value.strftime(STRFTIME_FMT))
+      when LogStash::Timestamp
+        # XXX: Using setString as opposed to setTimestamp, because setTimestamp
+        # doesn't behave correctly in some drivers (Known: sqlite)
+        #
+        # Additionally this does not use `to_iso8601`, since some SQL databases
+        # choke on the 'T' in the string (Known: Derby).
+        #
+        # strftime appears to be the most reliable across drivers.
+        statement.setString(idx + 1, value.time.strftime(STRFTIME_FMT))
+      when Fixnum, Integer
+        if value > 2147483647 or value < -2147483648
+          statement.setLong(idx + 1, value)
+        else
+          statement.setInt(idx + 1, value)
+        end
+      when BigDecimal
+        statement.setBigDecimal(idx + 1, value.to_java)
+      when Float
+        statement.setFloat(idx + 1, value)
+      when String
+        statement.setString(idx + 1, value)
+      when Array, Hash
+        statement.setString(idx + 1, value.to_json)
+      when true, false
+        statement.setBoolean(idx + 1, value)
+      else
+        statement.setString(idx + 1, nil)
+      end
+    end
+
+    statement
+  end
+
+  def onfailed_add_statement_event_params(statement, event)
+    @onfailed_statement[1..-1].each_with_index do |i, idx|
       if @enable_event_as_json_keyword == true and i.is_a? String and i == @event_as_json_keyword
         value = event.to_json
       elsif i.is_a? String
